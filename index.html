@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>切水果 · 挥手就玩</title>
+<style>
+  html, body {
+    margin: 0; height: 100%; background: #000; overflow: hidden;
+    display: flex; align-items: center; justify-content: center;
+    font-family: -apple-system, "PingFang SC", sans-serif;
+  }
+  canvas {
+    max-width: 100vw; max-height: 100vh;
+    width: auto; height: auto;
+    touch-action: none;
+  }
+  #loading {
+    position: fixed; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; color: #ddd;
+    background: #000; font-size: 15px; gap: 12px; z-index: 10;
+  }
+  #loading .bar { width: 220px; height: 4px; background: #222; border-radius: 2px; overflow: hidden; }
+  #loading .bar i { display: block; height: 100%; width: 30%; background: #4caf50; animation: slide 1.2s infinite; }
+  @keyframes slide { 0% { margin-left: -30%; } 100% { margin-left: 100%; } }
+</style>
+</head>
+<body>
+  <canvas id="game" width="900" height="640"></canvas>
+  <video id="cam" autoplay playsinline muted></video>
+  <div id="loading">
+    <div>正在加载手部识别模型…</div>
+    <div class="bar"><i></i></div>
+  </div>
+
+<script type="module">
+import { FilesetResolver, HandLandmarker } from "./vision_bundle.mjs";
+
+/* ==================== 常量 ==================== */
+const W = 900, H = 640;
+const GRAVITY = 0.38;
+const TRAIL_LEN = 16;
+const MAX_MISS = 3;
+const COMBO_WINDOW = 0.6;
+const HOLD_SECONDS = 3.0;
+const BOX = { x: W / 2 - 160, y: H / 2 - 120, w: 320, h: 240 };
+const BLADE = "#57ff57";
+
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const video = document.getElementById("cam");
+const loading = document.getElementById("loading");
+
+/* ==================== 图片 ==================== */
+const FRUIT_NAMES = ["apple", "watermelon", "orange", "banana", "strawberry", "grapes"];
+const imgs = {};
+
+function loadImages() {
+  return Promise.all([...FRUIT_NAMES, "bomb"].map(n => new Promise(res => {
+    const im = new Image();
+    im.onload = () => { imgs[n] = im; res(); };
+    im.onerror = () => { console.warn("缺图:", n); res(); };
+    im.src = "assets/" + n + ".png";
+  })));
+}
+
+/* ==================== 音效（WebAudio 合成，不需要音频文件） ==================== */
+let actx = null;
+function beep(freq, dur, type = "sine", vol = 0.2) {
+  try {
+    if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator();
+    const g = actx.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(freq, actx.currentTime);
+    o.frequency.exponentialRampToValueAtTime(freq * 1.6, actx.currentTime + dur);
+    g.gain.setValueAtTime(vol, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur);
+  } catch (e) { /* 浏览器没解锁音频就静音 */ }
+}
+
+/* ==================== 游戏对象 ==================== */
+class Fruit {
+  constructor(name, isBomb = false) {
+    this.name = name;
+    this.isBomb = isBomb;
+    this.x = 90 + Math.random() * (W - 180);
+    this.y = H + 60;
+    this.vx = (Math.random() - 0.5) * 5;
+    this.vy = -(18 + Math.random() * 4);
+    this.size = isBomb ? 110 : 100 + Math.random() * 50;
+    this.r = this.size * 0.42;
+    this.sliced = false;
+  }
+  update() {
+    this.x += this.vx;
+    this.y += this.vy;
+    this.vy += GRAVITY;
+  }
+  draw() {
+    const im = imgs[this.name];
+    if (im) ctx.drawImage(im, this.x - this.size / 2, this.y - this.size / 2, this.size, this.size);
+    else { ctx.beginPath(); ctx.arc(this.x, this.y, this.r, 0, 7); ctx.fillStyle = "#e74c3c"; ctx.fill(); }
+  }
+}
+
+class Half {
+  constructor(im, sx, sw, cx, cy, vx, vy, size) {
+    this.im = im; this.sx = sx; this.sw = sw;
+    this.cx = cx; this.cy = cy; this.vx = vx; this.vy = vy;
+    this.size = size; this.life = 110;
+  }
+  update() {
+    this.cx += this.vx; this.cy += this.vy; this.vy += GRAVITY; this.life--;
+  }
+  dead() { return this.life <= 0 || this.cy > H + 120 || this.cx < -150 || this.cx > W + 150; }
+  draw() {
+    if (!this.im) return;
+    ctx.drawImage(this.im, this.sx, 0, this.sw, this.im.height,
+                  this.cx - this.size / 4, this.cy - this.size / 2,
+                  this.size / 2, this.size);
+  }
+}
+
+class Particle {
+  constructor(x, y, color) {
+    this.x = x; this.y = y;
+    this.vx = (Math.random() - 0.5) * 14;
+    this.vy = -Math.random() * 11 + 2;
+    this.life = 26; this.color = color;
+    this.r = 3 + Math.random() * 4;
+  }
+  update() { this.x += this.vx; this.y += this.vy; this.vy += GRAVITY; this.life--; }
+  draw() {
+    if (this.life <= 0) return;
+    ctx.globalAlpha = this.life / 26;
+    ctx.beginPath(); ctx.arc(this.x, this.y, this.r, 0, 7);
+    ctx.fillStyle = this.color; ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+}
+
+/* ==================== 几何 ==================== */
+function pointSegDist(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  if (dx === 0 && dy === 0) return Math.hypot(px - ax, py - ay);
+  let t = ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy);
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+}
+
+/* ==================== 状态 ==================== */
+let state = "menu";
+let score = 0, miss = 0, combo = 0, hold = 0;
+let lastSlice = 0, showComboUntil = 0;
+let fruits = [], halves = [], particles = [];
+let trail = [];
+let smoothTip = null;
+let fps = 60, lastFrame = performance.now();
+let prevLandmark = null;
+
+/* ==================== 摄像头 + 模型 ==================== */
+let handLandmarker = null;
+let lastVideoTime = -1;
+
+async function init() {
+  await loadImages();
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 1280, height: 720, facingMode: "user" }, audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+  } catch (e) {
+    loading.innerHTML = "<div style='max-width:320px;text-align:center;line-height:1.7'>" +
+      "打不开摄像头。<br>请检查浏览器权限，或换用 Chrome / Safari。<br>" +
+      "注意：必须是 https 或 localhost。</div>";
+    return;
+  }
+  const vision = await FilesetResolver.forVisionTasks("./wasm");
+  handLandmarker = await HandLandmarker.createFromOptions(vision, {
+    baseOptions: { modelAssetPath: "./hand_landmarker.task", delegate: "GPU" },
+    runningMode: "VIDEO",
+    numHands: 1,
+    minHandDetectionConfidence: 0.5,
+    minTrackingConfidence: 0.5,
+  });
+  loading.style.display = "none";
+  requestAnimationFrame(loop);
+}
+
+function detectTip() {
+  if (!handLandmarker || video.readyState < 2) return null;
+  if (video.currentTime === lastVideoTime) return null;
+  lastVideoTime = video.currentTime;
+  const res = handLandmarker.detectForVideo(video, performance.now());
+  if (!res.landmarks || res.landmarks.length === 0) { prevLandmark = null; return null; }
+  const lm = res.landmarks[0];
+  // 画面是镜像的，x 要翻过来
+  const tip = { x: (1 - lm[8].x) * W, y: lm[8].y * H };
+  let px = tip.x, py = tip.y;
+  if (prevLandmark) {
+    const vx = tip.x - prevLandmark.x, vy = tip.y - prevLandmark.y;
+    if (Math.hypot(vx, vy) < 400) { px += vx * 0.8; py += vy * 0.8; }
+  }
+  prevLandmark = tip;
+  return { x: px, y: py, all: lm };
+}
+
+/* ==================== 绘制 ==================== */
+function drawVideo() {
+  const vw = video.videoWidth || W, vh = video.videoHeight || H;
+  const s = Math.max(W / vw, H / vh);
+  const dw = vw * s, dh = vh * s;
+  ctx.save();
+  ctx.translate(W, 0);
+  ctx.scale(-1, 1);
+  ctx.drawImage(video, (W - dw) / 2, (H - dh) / 2, dw, dh);
+  ctx.restore();
+}
+
+function drawSkeleton(lm) {
+  const P = lm.map(p => [(1 - p.x) * W, p.y * H]);
+  ctx.strokeStyle = "rgba(60,220,60,0.9)";
+  ctx.lineWidth = 2;
+  for (const [a, b] of HAND_CONN) {
+    ctx.beginPath(); ctx.moveTo(P[a][0], P[a][1]); ctx.lineTo(P[b][0], P[b][1]); ctx.stroke();
+  }
+  ctx.fillStyle = "#3cff3c";
+  for (const p of P) { ctx.beginPath(); ctx.arc(p[0], p[1], 3, 0, 7); ctx.fill(); }
+}
+
+const HAND_CONN = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],
+                   [5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],
+                   [13,17],[17,18],[18,19],[19,20],[0,17]];
+
+function drawBlade() {
+  for (let i = 1; i < trail.length; i++) {
+    ctx.strokeStyle = BLADE;
+    ctx.lineWidth = 2 + (i / trail.length) * 9;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(trail[i - 1].x, trail[i - 1].y);
+    ctx.lineTo(trail[i].x, trail[i].y);
+    ctx.stroke();
+  }
+  if (trail.length >= 2) {
+    const t = trail[trail.length - 1];
+    ctx.strokeStyle = BLADE; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(t.x, t.y, 12, 0, 7); ctx.stroke();
+  }
+}
+
+function text(str, x, y, size, color, align = "left") {
+  ctx.font = `600 ${size}px -apple-system, "PingFang SC", sans-serif`;
+  ctx.textAlign = align;
+  ctx.fillStyle = color;
+  ctx.fillText(str, x, y);
+}
+
+/* ==================== 主循环 ==================== */
+function loop(now) {
+  const dt = Math.min(0.05, (now - lastFrame) / 1000);
+  lastFrame = now;
+  fps = fps * 0.9 + (1 / Math.max(dt, 1e-3)) * 0.1;
+
+  drawVideo();
+
+  const tip = (state === "over") ? null : detectTip();
+  if (tip) {
+    smoothTip = smoothTip
+      ? { x: smoothTip.x * 0.35 + tip.x * 0.65, y: smoothTip.y * 0.35 + tip.y * 0.65 }
+      : { x: tip.x, y: tip.y };
+    trail.push({ x: smoothTip.x, y: smoothTip.y });
+    if (trail.length > TRAIL_LEN) trail.shift();
+    drawSkeleton(tip.all);
+  } else {
+    smoothTip = null;
+    if (state === "over") trail = [];
+  }
+
+  if (state === "menu") updateMenu(dt);
+  else if (state === "play") updatePlay(dt);
+  else updateOver();
+
+  render();
+
+  requestAnimationFrame(loop);
+}
+
+function updateMenu(dt) {
+  const inBox = smoothTip &&
+    smoothTip.x > BOX.x && smoothTip.x < BOX.x + BOX.w &&
+    smoothTip.y > BOX.y && smoothTip.y < BOX.y + BOX.h;
+  hold = inBox ? hold + dt : Math.max(0, hold - dt * 1.5);
+  if (hold >= HOLD_SECONDS) startGame();
+}
+
+function startGame() {
+  state = "play";
+  score = miss = combo = 0; hold = 0;
+  fruits = []; halves = []; particles = []; trail = [];
+  beep(880, 0.12, "triangle", 0.15);
+}
+
+function updatePlay(dt) {
+  // 出果
+  if (Math.random() < dt * (1.2 + score * 0.02)) {
+    const isBomb = Math.random() < 0.12;
+    const name = isBomb ? "bomb" : FRUIT_NAMES[Math.floor(Math.random() * FRUIT_NAMES.length)];
+    fruits.push(new Fruit(name, isBomb));
+  }
+
+  for (const f of fruits) f.update();
+
+  // 切中判定
+  if (trail.length >= 2) {
+    const a = trail[trail.length - 2], b = trail[trail.length - 1];
+    for (const f of fruits) {
+      if (f.sliced) continue;
+      if (pointSegDist(f.x, f.y, a.x, a.y, b.x, b.y) >= f.r) continue;
+      f.sliced = true;
+      if (f.isBomb) {
+        state = "over";
+        beep(110, 0.5, "sawtooth", 0.35);
+        for (let i = 0; i < 30; i++) particles.push(new Particle(f.x, f.y, "#e74c3c"));
+      } else {
+        combo = (performance.now() / 1000 - lastSlice < COMBO_WINDOW) ? combo + 1 : 1;
+        lastSlice = performance.now() / 1000;
+        score += Math.min(combo, 5);
+        if (combo >= 2) showComboUntil = performance.now() / 1000 + 1;
+        beep(520 + Math.min(combo, 5) * 90, 0.07, "sine", 0.15);
+
+        // 两半
+        const im = imgs[f.name];
+        if (im) {
+          const dx = b.x - a.x, dy = b.y - a.y;
+          const n = Math.hypot(dx, dy) || 1;
+          const ux = -dy / n, uy = dx / n;
+          halves.push(new Half(im, 0, im.width / 2, f.x - f.size * 0.25, f.y,
+                               f.vx + ux * 4.5, f.vy + uy * 4.5 - 1.5, f.size));
+          halves.push(new Half(im, im.width / 2, im.width / 2, f.x + f.size * 0.25, f.y,
+                               f.vx - ux * 4.5, f.vy - uy * 4.5 - 1.5, f.size));
+        }
+        for (let i = 0; i < 14; i++) particles.push(new Particle(f.x, f.y, "#ffd24a"));
+      }
+    }
+  }
+
+  // 漏果
+  const alive = [];
+  for (const f of fruits) {
+    if (f.sliced) continue;
+    if (f.y - f.size > H + 80) {
+      if (!f.isBomb) { miss++; beep(180, 0.12, "square", 0.12); }
+      continue;
+    }
+    alive.push(f);
+  }
+  fruits = alive;
+  if (miss >= MAX_MISS) { state = "over"; beep(110, 0.5, "sawtooth", 0.3); }
+
+  for (const h of halves) h.update();
+  halves = halves.filter(h => !h.dead());
+  for (const p of particles) p.update();
+  particles = particles.filter(p => p.life > 0);
+}
+
+function updateOver() {
+  for (const h of halves) h.update();
+  halves = halves.filter(h => !h.dead());
+  for (const p of particles) p.update();
+  particles = particles.filter(p => p.life > 0);
+}
+
+function render() {
+  for (const h of halves) h.draw();
+  for (const f of fruits) f.draw();
+  for (const p of particles) p.draw();
+  if (state !== "over") drawBlade();
+
+  if (state === "play") {
+    text("Score: " + score, 20, 45, 30, "#fff");
+    text("Miss: " + miss + "/" + MAX_MISS, W - 20, 45, 24, "#eee", "right");
+    if (combo >= 2 && performance.now() / 1000 < showComboUntil) {
+      text("COMBO x" + combo, W / 2, 120, 46, "#ffd24a", "center");
+    }
+  } else if (state === "menu") {
+    text("切水果", W / 2, 110, 56, "#fff", "center");
+    ctx.strokeStyle = BLADE; ctx.lineWidth = 3;
+    ctx.strokeRect(BOX.x, BOX.y, BOX.w, BOX.h);
+    text("把手放进绿框里 3 秒", BOX.x + BOX.w / 2, BOX.y - 20, 24, "#ddd", "center");
+    const bw = BOX.w * Math.min(1, hold / HOLD_SECONDS);
+    ctx.fillStyle = "rgba(80,80,80,0.8)";
+    ctx.fillRect(BOX.x, BOX.y + BOX.h + 18, BOX.w, 20);
+    ctx.fillStyle = BLADE;
+    ctx.fillRect(BOX.x, BOX.y + BOX.h + 18, bw, 20);
+    text("点一下屏幕也能开始", BOX.x + BOX.w / 2, BOX.y + BOX.h + 74, 18, "#999", "center");
+  } else {
+    ctx.fillStyle = "rgba(0,0,0,0.45)";
+    ctx.fillRect(0, 0, W, H);
+    text("GAME OVER", W / 2, H / 2 - 30, 56, "#ff5252", "center");
+    text("得分 " + score, W / 2, H / 2 + 40, 34, "#fff", "center");
+    text("按 R 重开 / 点屏幕重开", W / 2, H / 2 + 100, 20, "#bbb", "center");
+  }
+
+  text(Math.round(fps) + " fps", W - 12, H - 12, 14, "rgba(200,200,200,0.7)", "right");
+}
+
+/* ==================== 交互 ==================== */
+window.addEventListener("keydown", e => {
+  if (e.code === "Space" && state === "menu") startGame();
+  if (e.key.toLowerCase() === "r" && state === "over") { state = "menu"; hold = 0; }
+});
+canvas.addEventListener("pointerdown", () => {
+  if (!actx) beep(1, 0.01, "sine", 0.001);   // 解锁音频
+  if (state === "menu") startGame();
+  else if (state === "over") { state = "menu"; hold = 0; }
+});
+
+init();
+</script>
+</body>
+</html>
