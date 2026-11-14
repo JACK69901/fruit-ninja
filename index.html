@@ -371,6 +371,10 @@ function updatePlay(dt) {
 }
 
 function updateOver() {
+  // 结束后果继续往下掉，掉出屏幕就清掉——否则会僵在画面上
+  for (const f of fruits) f.update();
+  fruits = fruits.filter(f => f.y - f.size < H + 80);
+
   for (const h of halves) h.update();
   halves = halves.filter(h => !h.dead());
   for (const p of particles) p.update();
